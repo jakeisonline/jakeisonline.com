@@ -1,0 +1,188 @@
+---
+title: Your event listeners are probably leaking memory
+description: Event listeners are a powerful way to handle user interactions, but they can also be a source of memory leaks if not managed properly.
+category: "JavaScript"
+coverImage: "/images/og-javascript-sticky-header.png"
+---
+
+import Callout from "@/components/blocks/callout.astro"
+
+When you add a listener with [`addEventListener`](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener) and never remove it, for example when a component unmounts or a modal closes, that listener can keep references alive and prevent garbage collection.
+
+To manage that problem you simply pair every single `addEventListener` with an exact-matching [`removeEventListener`](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/removeEventListener) when you're done. Just remember to store exactly how you added that listener so you can remove it later. Oh and `addEventListener` returns absolutely nothing, just to be extra helpful.
+
+A small helper can centralise that bookkeeping so you can add, remove individually, remove by group, or tear down everything in one go.
+
+## Why lifecycle matters
+
+If you've ever written something like this, you're not alone:
+
+```js showLineNumbers
+element.addEventListener("click", () => console.log("clicked"))
+// Later: how do we remove this? We don't have the function reference.
+```
+
+The listener is an inline function, so you never get a reference back. To remove it you must call `removeEventListener` with the **exact same** function and the same `options` (e.g. `capture` or `passive`) you used when adding. That usually forces you to store the handler in a variable and repeat it in both calls. When you have many listeners - on a popover, a dropdown, or a long-lived component - tracking them all and cleaning up in the right order gets messy and very un-DRY quickly.
+
+## An EventListeners helper
+
+A simple pattern is to introduce a small class that wraps `addEventListener` and `removeEventListener` and keeps track of every listener you add. You can then remove them one by one, by group, or all at once.
+
+Here's the shape of the API: you create an instance, call `add()` with the target, event type, and listener (and optional options including a custom `group`), and you get back a `Listener` with a `remove()` method. The class also exposes `remove(groupName)` and `removeAll()`.
+
+### Adding a listener
+
+Call `add()` with an object that has `target`, `type`, and `listener`. You can pass standard [`AddEventListenerOptions`](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener#options) (e.g. `capture`, `passive`, `signal`) and an optional `group` so you can remove sets of listeners later.
+
+```ts showLineNumbers
+const listeners = new EventListeners()
+
+listeners.add({
+  target: document.body,
+  type: "click",
+  listener: () => console.log("clicked"),
+})
+```
+
+The method returns a `Listener` object. Hold on to it if you want to remove just that listener later; otherwise you can ignore the return value and rely on groups or `removeAll()`.
+
+### Removing a single listener
+
+When you need to remove one listener, use the `Listener` returned from `add()` and call its `remove()` method.
+
+```ts showLineNumbers
+const listeners = new EventListeners()
+const listener = listeners.add({
+  target: root.popover,
+  type: "click",
+  listener: () => console.log("clicked"),
+})
+
+// Later, when the popover closes or the component unmounts:
+listener.remove()
+```
+
+<br />
+<Callout type="note" title="Keeping references">
+  If you assign the return value of `add()` to a variable, you must call
+  `remove()` on that variable when you're done. Calling `removeAll()` does not
+  remove listeners that are still referenced elsewhere; it only removes them
+  from the DOM and from the helper's internal set.
+</Callout>
+
+### Grouping listeners
+
+For UI that has several related listeners - such as a popover with click, keydown, and focus listeners - you can add them to a named group and remove the whole group in one call.
+
+```ts showLineNumbers
+const listeners = new EventListeners()
+
+listeners.add(
+  { target: root.popover, type: "click", listener: handleClick },
+  { group: "popoverListeners" },
+)
+listeners.add(
+  { target: root.popover, type: "keydown", listener: handleKeydown },
+  { group: "popoverListeners" },
+)
+
+// When the popover closes:
+listeners.remove("popoverListeners")
+```
+
+That way you don't have to store each `Listener` or remember every target/type/listener when cleaning up.
+
+### Removing all listeners
+
+When a component or feature is torn down and you want to remove every listener managed by that instance, call `removeAll()`.
+
+```ts showLineNumbers
+const listeners = new EventListeners()
+listeners.add(
+  { target: root.popover, type: "click", listener: () => {} },
+  { group: "popoverListeners" },
+)
+// and the rest...
+
+listeners.removeAll()
+```
+
+After that, the instance's internal set is cleared and all of those listeners have been removed from their targets.
+
+## The implementation
+
+Below is a full implementation you can drop into your project. It stores each listener's `target`, `type`, `listener`, and optional `group`, and forwards to the native `addEventListener` and `removeEventListener` so behaviour (including options like `capture` or `passive`) stays the same.
+
+```ts showLineNumbers
+interface AddParams {
+  target: EventTarget
+  type: string
+  listener: EventListener
+  options?: AddEventListenerOptions & Omit<AddEventListenerOptions, "signal">
+}
+
+interface AddEventListenerOptions {
+  group?: string
+}
+
+export interface Listener {
+  remove(): void
+}
+
+export class EventListeners {
+  private listeners = new Set<{
+    target: EventTarget
+    type: string
+    listener: EventListener
+    group?: string
+  }>()
+
+  add({ target, type, listener, options }: AddParams): Listener {
+    const { group, ...eventOptions } = options || {}
+
+    target.addEventListener(type, listener, eventOptions)
+
+    const listenerRef = { target, type, listener, group }
+    this.listeners.add(listenerRef)
+
+    return {
+      remove: () => {
+        target.removeEventListener(type, listener, eventOptions)
+        this.listeners.delete(listenerRef)
+      },
+    } as Listener
+  }
+
+  remove(groupName: string): void {
+    const groupListeners = Array.from(this.listeners).filter(
+      ({ group }) => group === groupName,
+    )
+
+    if (!groupListeners.length) {
+      return
+    }
+
+    groupListeners.forEach((listenerRef) => {
+      const { target, type, listener } = listenerRef
+      target.removeEventListener(type, listener)
+      this.listeners.delete(listenerRef)
+    })
+  }
+
+  removeAll(): void {
+    this.listeners.forEach(({ target, type, listener }) => {
+      target.removeEventListener(type, listener)
+    })
+    this.listeners.clear()
+  }
+}
+```
+
+A few details worth noting:
+
+- **`add()`** destructures `options` so that `group` is not passed through to the native `addEventListener`; the rest (e.g. `capture`, `passive`) is passed as `eventOptions`.
+- **`Listener.remove()`** calls `removeEventListener` with the same `eventOptions` so the browser correctly matches and removes the listener, then deletes the entry from the internal set.
+- **`remove(groupName)`** finds all entries with that `group`, removes each listener from its target, and deletes those entries from the set.
+- **`removeAll()`** does the same for every stored listener and then clears the set.
+
+Using this pattern, you can attach listeners wherever you need them and clean up by calling `listener.remove()`, `listeners.remove("groupName")`, or `listeners.removeAll()` at the right time—e.g. in a cleanup function, when a modal closes, or when a component unmounts—so you avoid leaving listeners and their closures in memory.
